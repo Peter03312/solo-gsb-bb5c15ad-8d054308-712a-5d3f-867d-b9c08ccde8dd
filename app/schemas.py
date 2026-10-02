@@ -66,6 +66,35 @@ class TravelControlListOut(BaseModel):
     )
 
 
+# ---- 狭窄水道组 -------------------------------------------------------------------
+
+class ChannelGroupCreateRequest(BaseModel):
+    segments: list[int] = Field(
+        min_length=2,
+        description="航段编号集合（至少 2 条）；组建成后不可修改，航段不得重复归组",
+    )
+    note: Optional[str] = None
+
+
+class ChannelGroupMemberOut(BaseModel):
+    position: int = Field(description="成员在提交集合中的次序（0 起）")
+    seg_id: int = Field(description="成员航段编号")
+    origin: str
+    destination: str
+    travel_time: int = Field(description="航段基础航时（正整数分钟）")
+    depth: float
+    clearance: Optional[float] = None
+
+
+class ChannelGroupOut(BaseModel):
+    group_id: int = Field(description="狭窄水道组号（自增、不可变）")
+    note: Optional[str] = None
+    created_at: str
+    members: list[ChannelGroupMemberOut] = Field(
+        description="组成员航段（按提交次序）；组建成后不可修改"
+    )
+
+
 # ---- 潮位 ----------------------------------------------------------------------
 
 class TideCorrection(BaseModel):

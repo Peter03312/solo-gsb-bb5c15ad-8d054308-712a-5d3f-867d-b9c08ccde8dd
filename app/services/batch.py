@@ -18,6 +18,7 @@ import sqlite3
 from typing import Iterable, Optional
 
 from ..errors import ApiError
+from .groups import expand_group_occupancy, load_groups
 from .planning import find_itinerary, load_occupancy
 
 
@@ -40,15 +41,20 @@ def _ship_kwargs(ship) -> dict:
     }
 
 
-def _add_itinerary_occupancy(blocked: dict[int, set[int]], legs: Iterable[dict]) -> None:
+def _add_itinerary_occupancy(blocked: dict[int, set[int]], legs: Iterable[dict],
+                             groups=None) -> None:
     """把一段行程（拟占用或已复算占用）并入 blocked：{seg_id: {绝对分钟}}。
 
     占用语义与 load_occupancy 一致：进入分钟 d 占用 d..d+travel_time-1，
-    抵达分钟不占用。
+    抵达分钟不占。groups 给定时按当前狭窄水道组关系把占用展开到同组全部
+    成员（船进入组内任一航段即独占整组，批内后船同样受此约束）。
     """
     for leg in legs:
         d, t = leg["start_minute"], leg["travel_time"]
         blocked.setdefault(leg["seg_id"], set()).update(range(d, d + t))
+    if groups is not None:
+        seg_to_group, group_members = groups
+        expand_group_occupancy(blocked, seg_to_group, group_members)
 
 
 def _norm_legs(legs) -> list[tuple]:
@@ -106,6 +112,7 @@ def plan_batch(conn, ships: list, revision: Optional[int]) -> dict:
     lo = min(s.start_minute for s in ships)
     hi = max(s.start_minute + s.window_minutes - 1 for s in ships)
     blocked = load_occupancy(conn, lo, hi)
+    groups = load_groups(conn)
 
     results = []
     for i, ship in enumerate(ships):
@@ -115,7 +122,7 @@ def plan_batch(conn, ships: list, revision: Optional[int]) -> dict:
             )
         except ApiError as exc:
             raise _tag_ship_error(i, exc)
-        _add_itinerary_occupancy(blocked, result["itinerary"])
+        _add_itinerary_occupancy(blocked, result["itinerary"], groups)
         results.append({"index": i, **result})
     return {"revision": rev, "ships": results}
 
@@ -223,6 +230,7 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
         lo = min(s.start_minute for s in body.ships)
         hi = max(s.start_minute + s.window_minutes - 1 for s in body.ships)
         blocked = load_occupancy(conn, lo, hi)
+        groups = load_groups(conn)
 
         trip_refs: list[dict] = []
         for i, ship in enumerate(body.ships):
@@ -268,8 +276,8 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
                 "arrival_minute": recalculated["arrival_minute"],
                 "itinerary": recalculated["itinerary"],
             })
-            # 前船复算行程作为后船的当时占用
-            _add_itinerary_occupancy(blocked, recalculated["itinerary"])
+            # 前船复算行程作为后船的当时占用（按当前组关系展开到整组）
+            _add_itinerary_occupancy(blocked, recalculated["itinerary"], groups)
 
         result = {
             "idempotency_key": key,

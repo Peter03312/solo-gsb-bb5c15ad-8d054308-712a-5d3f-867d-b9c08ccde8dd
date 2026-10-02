@@ -49,6 +49,19 @@
 既有占用时长不随管制变化**；潮位复核仍按原快照占用，仅在发生改期时以当前管制求解。
 旧接口路径与字段完全不变。
 
+**本轮新增狭窄水道组**：调度员可把**至少两条现有航段**登记为同一狭窄水道组
+（`POST /api/channel-groups`，提交航段编号集合，返回组号及成员）。组建成后
+**不可修改**（无更新/解散），航段**不得重复归组**；未知航段
+（`SEGMENT_NOT_FOUND`）、提交含重复编号（`DUPLICATE_SEGMENT_IN_GROUP`）或
+成员已归组（`SEGMENT_ALREADY_GROUPED`）一律拒绝，单事务内**不留半成品**。
+船进入组内任一航段后，从**进入分钟到抵达前一分钟**（`d..d+t-1`）**独占整组**——
+不同成员航段的通行也不得重叠，抵达分钟 `d+t` 可由下一船进入。**组建前**的已确认
+快照按其**原航段与固化航时**计入新组占用，既有快照**不改写**、组建前已有重叠也
+**不清理**。单船与批次**预排**均须避开组占用；**确认**时在原事务内按**当前组
+关系**与已确认及批内拟占用复算，不一致沿用 `PLAN_MISMATCH` 且整批回滚（批次的
+同键重放语义不变）。**改期建议**须避开其他快照的组占用并排除自身，而原行程
+**安全复核仍只判断潮位**。旧接口路径与字段完全不变。
+
 ---
 
 ## 1. 启动
@@ -149,6 +162,33 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
     规划仍然封闭。
   - **规划接口只读、不占位**：调用 `/api/trips/plan` 不产生任何占用，只有
     `/api/trips/confirm` 成功后才生成占用。
+- **狭窄水道组（独占整组）**：调度员可把至少两条现有航段登记为同一狭窄水道组。
+  - **组建**（`POST /api/channel-groups`）：提交航段编号集合（至少 2 条，
+    schema 层 `VALIDATION_ERROR` 兜底），返回组号（自增）与成员（按提交次序）。
+    组**建成即不可变**：无更新、无解散接口；每条航段至多属于一个组。
+  - **拒绝口径（任一失败均不留半成品，组建在单事务内完成）**：
+    提交编号含重复 → `422 DUPLICATE_SEGMENT_IN_GROUP`；任一航段不存在 →
+    `404 SEGMENT_NOT_FOUND`（`details.unknown_seg_ids`）；任一航段已归组 →
+    `409 SEGMENT_ALREADY_GROUPED`（`details.conflicts` 给出冲突航段与既有组号，
+    并发竞争由数据库唯一约束兜底同样返回此码）。
+  - **独占整组**：船于分钟 `d` 进入组内**任一**成员航段、该段固化航时 `t`，
+    则 `d..d+t-1` 这同一批分钟对组内**全部**成员航段封闭（于 `d+t` 抵达，
+    抵达分钟可由下一船进入任一成员航段）。即不同成员航段的通行也不得重叠；
+    一条船连续走过组内多段时，其前后各段占用按同一展开口径也不会误伤自身
+    （预排/复算只把**其他船**的占用计入 blocked）。
+  - **组建前快照回溯计入、但不改写**：组建后，组建前已确认快照只要其原行程
+    经过组内任一航段，该段按**原航段与固化 `travel_time`** 的占用即展开到全组；
+    快照本身绝不改写，组建前快照间**已有的重叠也不清理**（展开后重叠分钟仍
+    原样对后续规划封闭）。
+  - **对既有流程的影响**：单船 `/api/trips/plan`、批次 `/api/trips/batch/plan`
+    自动避开展开后的组占用（批次后船还须避开前船**拟占用**的组展开）；单船
+    `/api/trips/confirm` 与批次 `/api/trips/batch/confirm` 在原事务内按
+    **当前组关系** + 当时已确认占用（批次另含批内复算占用）重新求解，组关系
+    变化使窗口无解或行程不一致仍为 `409 PLAN_MISMATCH`（批次整批回滚），
+    同键重放仍优先返回首次结果；**改期建议**避开其他快照的组占用但排除自身
+    快照（`exclude_trip_id`），而**原行程潮位安全复核完全不读取占用/组关系**。
+    查询：`GET /api/channel-groups`（全量）、`GET /api/channel-groups/{id}`
+    （详情，未知组 `404 CHANNEL_GROUP_NOT_FOUND`）。
   每个修订的逐分钟数据含**名义潮位 `level`** 与**非负预测误差
   `error`（米）**，真实潮位落在 `[level−error, level+error]`。占用的**每一分钟**都
   必须同时满足（按误差带取对应极值）：
@@ -256,12 +296,37 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 分时管制航段未知（替换/查询） | 404 | `SEGMENT_NOT_FOUND` |
 | 分时管制区间非法（`start<0` / `end<=start` / 通行分钟非正整数） | 422 | `INVALID_CONTROL_INTERVAL`（失败不改旧管制） |
 | 分时管制组内半开区间分钟交叠 | 422 | `OVERLAPPING_CONTROL_INTERVAL`（失败不改旧管制） |
+| 狭窄水道组成员不足 2 条（含空集合） | 422 | `VALIDATION_ERROR` |
+| 狭窄水道组提交编号含重复 | 422 | `DUPLICATE_SEGMENT_IN_GROUP`（不组建） |
+| 狭窄水道组含未知航段 | 404 | `SEGMENT_NOT_FOUND`（`details.unknown_seg_ids`，不组建） |
+| 狭窄水道组成员已归属某组（含并发竞争） | 409 | `SEGMENT_ALREADY_GROUPED`（不组建、旧组不变） |
+| 查询的狭窄水道组不存在 | 404 | `CHANNEL_GROUP_NOT_FOUND` |
 
 ---
 
 ## 3. HTTP API
 
-> **本轮用法（航段分时航时管制）**：旧 API 路径与请求/响应结构完全不变，
+> **本轮用法（狭窄水道组）**：新增三个只读/登记端点，旧 API 路径与请求/响应
+> 结构完全不变；组建成即不可变，所有规划/确认/批次/改期自动按当前组关系工作——
+> - `POST /api/channel-groups`：提交**航段编号集合**（至少 2 条）登记狭窄水道组，
+>   返回 `group_id` 与按提交次序排列的 `members`（含航段起终点/基础航时/水深/净空）；
+>   重复编号 `422 DUPLICATE_SEGMENT_IN_GROUP`、未知航段
+>   `404 SEGMENT_NOT_FOUND`、成员已归组 `409 SEGMENT_ALREADY_GROUPED`，
+>   任一失败均不留下半成品组；
+> - `GET /api/channel-groups` / `GET /api/channel-groups/{group_id}`：列出全部组
+>   或读取指定组（未知组 `404 CHANNEL_GROUP_NOT_FOUND`）；
+> - **独占整组**：船进入组内任一航段即按该段固化航时 `d..d+t-1` 独占整组，
+>   `POST /api/trips/plan` 与 `POST /api/trips/batch/plan` 自动避开展开后的组
+>   占用（批次后船同时避开前船拟占用的组展开，仍只读不占位）；
+> - `POST /api/trips/confirm` / `POST /api/trips/batch/confirm`：在原事务内按
+>   **当前组关系**与当时已确认及批内拟占用复算，无解/不一致仍为
+>   `409 PLAN_MISMATCH`（批次整批回滚、同键重放返回首次结果）；
+> - **组建前**的已确认快照按原航段与固化航时回溯计入新组占用，快照不改写、
+>   既有重叠不清理；
+> - `POST /api/trips/{id}/review`：原行程潮位安全复核**仍只判断潮位**；需要
+>   改期时，建议避开**其他**快照的组占用（排除自身），建议不占位。
+>
+> **上一轮用法（航段分时航时管制）**：旧 API 路径与请求/响应结构完全不变，
 > 新增一个按航段整组替换管制的端点；规划/确认/批次/复核自动按实际航时工作——
 > - `PUT /api/segments/{seg_id}/travel-controls`：以航段编号提交一组半开分钟区间
 >   `[start_minute, end_minute)` 与正整数 `travel_time`，**整组替换**旧管制并返回
@@ -296,8 +361,11 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/nodes` | 节点列表 |
 | POST | `/api/segments` | 录入单向航段 |
 | GET | `/api/segments` | 航段列表（按编号排序） |
-| PUT | `/api/segments/{seg_id}/travel-controls` | **本轮新增**：以航段编号整组替换分时航时管制（半开区间 + 通行分钟，空组恢复基础航时），返回生效清单 |
-| GET | `/api/segments/{seg_id}/travel-controls` | **本轮新增**：查询航段当前生效的分时管制清单（含基础航时） |
+| PUT | `/api/segments/{seg_id}/travel-controls` | 以航段编号整组替换分时航时管制（半开区间 + 通行分钟，空组恢复基础航时），返回生效清单 |
+| GET | `/api/segments/{seg_id}/travel-controls` | 查询航段当前生效的分时管制清单（含基础航时） |
+| POST | `/api/channel-groups` | **本轮新增**：提交航段编号集合（≥2）登记狭窄水道组，返回组号及按提交次序的成员；建成不可变、不可重复归组 |
+| GET | `/api/channel-groups` | **本轮新增**：狭窄水道组列表（按组号升序） |
+| GET | `/api/channel-groups/{group_id}` | **本轮新增**：狭窄水道组详情（组号、备注、成员航段信息） |
 | GET | `/api/tide/revisions` | 潮位修订列表 |
 | GET | `/api/tide/revisions/{rev}?from_minute=&to_minute=` | 取某修订逐分钟名义潮位 `levels` 与预测误差 `errors` |
 | POST | `/api/tide/corrections` | 名义潮位更正（继承误差），生成新修订 |
@@ -395,6 +463,52 @@ curl -s -X PUT $BASE/api/segments/2/travel-controls \
 `[0,360)` 管制为 60 分钟时，于第 30 分钟进入 B→C 将占 30..89、第 90 分钟抵达
 C（即使第 360 分钟已跨越管制边界，航时仍为 60）；第 360 分钟及以后进入则
 沿用 `[360,720)` 的 45 分钟或区间外的基础 40 分钟。
+
+### 狭窄水道组请求 / 响应示例（本轮新增）
+
+提交**至少两条**现有航段的编号集合即可登记为同一狭窄水道组；成员按**提交
+次序**返回（集合中的重复编号会被拒绝）：
+
+```json
+POST /api/channel-groups
+{
+  "segments": [1, 2],
+  "note": "北岸狭水道：A->B 与 B->C 单向交替通行"
+}
+```
+
+成功返回 `201`：
+
+```json
+{
+  "group_id": 1,
+  "note": "北岸狭水道：A->B 与 B->C 单向交替通行",
+  "created_at": "2026-10-02 15:24:27",
+  "members": [
+    {"position": 0, "seg_id": 1, "origin": "A", "destination": "B",
+     "travel_time": 30, "depth": 6.0, "clearance": null},
+    {"position": 1, "seg_id": 2, "origin": "B", "destination": "C",
+     "travel_time": 40, "depth": 4.0, "clearance": 8.0}
+  ]
+}
+```
+
+- 组**建成即不可变**：没有更新/解散端点，航段也不能再加入其他组
+  （再次提交含 `1` 或 `2` 的集合 → `409 SEGMENT_ALREADY_GROUPED`，
+  `details.conflicts` 给出 `[{"seg_id":1,"group_id":1}]`）；
+- `segments` 少于 2 条（含空）→ `422 VALIDATION_ERROR`；
+  同一编号重复出现（如 `[1,2,1]`）→ `422 DUPLICATE_SEGMENT_IN_GROUP`；
+  含未知航段（如 `[1,404]`）→ `404 SEGMENT_NOT_FOUND`
+  （`details.unknown_seg_ids=[404]`）；
+- 任一失败在单事务内回滚，**不产生半成品组**（`GET /api/channel-groups`
+  仍只列出此前已建成的组）。
+
+**独占整组的规划效果**：组 `{1,2}` 建成后，一艘已确认船于第 0 分钟进入
+航段 1（航时 30，占 `0..29`、第 30 分钟抵达 B），则航段 2 的 `0..29` 分钟
+同步封闭；此时从 B 出发经航段 2 去 C 的规划最早只能于**第 30 分钟**进入
+航段 2（先船的**抵达分钟即可进入**），而组外的航段 3（C→D）不受影响、
+第 0 分钟仍可进入。组建前已确认、经过组内任一航段的快照也按其固化航时
+同样展开（快照本身不改写）。
 
 ### 规划请求 / 响应示例
 
@@ -624,7 +738,23 @@ curl -s $BASE/health
 # 查看演示航段
 curl -s $BASE/api/segments
 
-# 0) 本轮新增：为航段 2 设置分时航时管制（整组替换；空组 [] 恢复基础航时）
+# 0) 本轮新增：登记狭窄水道组（提交至少两条航段编号集合；建成不可变）
+curl -s -X POST $BASE/api/channel-groups \
+  -H 'Content-Type: application/json' \
+  -d '{"segments":[1,2],"note":"北岸狭水道"}'
+# {"group_id":1,"note":"北岸狭水道","created_at":"...","members":[{"position":0,...seg_id:1...},{"position":1,...seg_id:2...}]}
+# 查询
+curl -s $BASE/api/channel-groups
+curl -s $BASE/api/channel-groups/1
+# 重复编号 / 未知航段 / 冲突归组分别返回
+# 422 DUPLICATE_SEGMENT_IN_GROUP / 404 SEGMENT_NOT_FOUND / 409 SEGMENT_ALREADY_GROUPED
+curl -s -i -X POST $BASE/api/channel-groups -H 'Content-Type: application/json' \
+  -d '{"segments":[1,2,1]}' | head -1   # HTTP/1.1 422
+
+# 组建后规划自动按整组独占避让（只读不占位）；确认/批次确认在事务内按
+# 当前组关系复算，组建后用旧规划结果确认 -> 409 PLAN_MISMATCH（批次整批回滚）
+
+# 0b) 上一轮新增：为航段 2 设置分时航时管制（整组替换；空组 [] 恢复基础航时）
 #    [0,360) 内进入航时 60 分钟，[360,720) 内进入航时 45 分钟，其余分钟用基础航时
 curl -s -X PUT $BASE/api/segments/2/travel-controls \
   -H 'Content-Type: application/json' \
@@ -824,6 +954,54 @@ stale = requests.post(f"{B}/api/trips/confirm", json=plan)
 assert stale.status_code == 409 and stale.json()["error"]["code"] == "PLAN_MISMATCH"
 ```
 
+Python 示例（狭窄水道组登记 → 整组独占规划/确认 → 旧预排批次整批回滚）：
+
+```python
+import requests
+
+B = "http://localhost:8000"
+
+# 1) 把航段 1（A->B）与航段 2（B->C）登记为同一狭窄水道组
+r = requests.post(f"{B}/api/channel-groups",
+                  json={"segments": [1, 2], "note": "北岸狭水道"})
+r.raise_for_status()
+group = r.json()
+print("组号", group["group_id"], "成员", [m["seg_id"] for m in group["members"]])
+
+# 重复归组 / 重复编号 / 未知航段均拒绝，且不留半成品
+conflict = requests.post(f"{B}/api/channel-groups", json={"segments": [1, 3]})
+assert conflict.status_code == 409
+assert conflict.json()["error"]["code"] == "SEGMENT_ALREADY_GROUPED"
+
+# 2) 船 0 确认走 A->B：seg1 占 0..29
+plan0 = requests.post(f"{B}/api/trips/plan", json={
+    "origin": "A", "destination": "B", "start_minute": 0, "window_minutes": 1440,
+    "draft": 5.0, "height": 2.0, "margin": 0.5,
+}).json()
+requests.post(f"{B}/api/trips/confirm", json=plan0).raise_for_status()
+
+# 3) 船 1 走 B->C：seg2 自身从未被直接占用，但组展开封锁 0..29，
+#    最早第 30 分钟（船 0 的抵达分钟）进入
+plan1 = requests.post(f"{B}/api/trips/plan", json={
+    "origin": "B", "destination": "C", "start_minute": 0, "window_minutes": 1440,
+    "draft": 3.0, "height": 2.0, "margin": 0.5,
+}).json()
+assert plan1["itinerary"][0]["start_minute"] == 30
+print("seg2 可进入分钟", plan1["itinerary"][0]["start_minute"])
+
+# 4) 批次预排后组建水道组，再确认 -> 事务内按当前组关系复算，PLAN_MISMATCH、
+#    整批回滚（GET /api/trips 不会多出任何一条）；重新预排后确认即可成功
+ships = [
+    {"origin": "A", "destination": "B", "start_minute": 0, "window_minutes": 1440,
+     "draft": 5.0, "height": 2.0, "margin": 0.5},
+    {"origin": "B", "destination": "C", "start_minute": 0, "window_minutes": 1440,
+     "draft": 3.0, "height": 2.0, "margin": 0.5},
+]
+# （略：在另一条未归组航段集上可完整复现；错误码断言如下）
+# assert confirm.status_code == 409
+# assert confirm.json()["error"]["code"] == "PLAN_MISMATCH"
+```
+
 录入自定义数据：
 
 ```bash
@@ -840,8 +1018,8 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 
 1. 校验节点与修订；取窗口内全部名义潮位与预测误差，任一分钟缺名义潮位立即报
    `MISSING_TIDE_DATA`；同时读取窗口内全部已确认快照的航段占用
-   （`load_occupancy`，既有快照彼此重叠也原样计入）与各航段的分时航时管制
-   （`load_controls`）；
+   （`load_occupancy`，既有快照彼此重叠也原样计入，并按当前狭窄水道组关系
+   展开为整组占用）与各航段的分时航时管制（`load_controls`）；
 2. 对每条航段用"不可行分钟前缀和"预处理：任意进入分钟先按管制选定**实际航时**
    （进入分钟命中区间取该区间通行分钟，否则取基础航时；途中跨边界不变），再判定
    该实际航程是否全程满足误差带约束（水深 `深度+名义−误差`、净空
@@ -857,23 +1035,48 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 剪枝依据：若序列 `s1 < s2`（字典序），则对任意后缀 `x` 恒有 `s1+x < s2+x`，
 故同一 `(节点, 分钟)` 只需保留最小序列，不会丢失最优解。复杂度 O(W·E)（W≤1440）。
 
+### 狭窄水道组（实现见 `app/services/groups.py`）
+
+1. 建表两张：`channel_groups`（组号自增、备注；建成后**无任何更新/删除路径**）
+   与 `channel_group_members`（`group_id, seg_id, position`，`seg_id UNIQUE`
+   从数据库层保证航段不得重复归组）。
+2. `create_group`：先在内存判重（`DUPLICATE_SEGMENT_IN_GROUP`），再一次查出
+   未知航段（`SEGMENT_NOT_FOUND`）与已归组航段（`SEGMENT_ALREADY_GROUPED`），
+   全部通过后在单个 `BEGIN IMMEDIATE` 事务内插入组与全部成员；任一异常
+   `ROLLBACK`（不留半成品），并发竞争由 `seg_id` 唯一约束兜底并转成同一
+   冲突码。
+3. **组占用展开**：`load_occupancy` 读出全部快照的原占用后，调用
+   `expand_group_occupancy` 取闭包——凡某航段属于组，其已计入的占用分钟
+   同步到同组每个成员，反复传播至稳定。展开按各快照段**固化的
+   `travel_time`**（`d..d+t-1`）进行，因此**组建前**的快照只要经过组内任一
+   航段即自动回溯计入新组占用，而快照 JSON 绝不改写；组建前已有的重叠同样
+   不清理（展开后仍为重叠事实）。
+4. 单船规划/确认、批次预排/确认均经由 `load_occupancy` 取得展开后的占用；
+   批次内前船的**拟占用/复算占用**在并入内存 blocked 后也调用同一展开函数
+   （组关系在批次确认事务开始时读取一次，组建成后不可变，事务内无失效窗口）。
+5. 复核改期以 `load_occupancy(exclude_trip_id=本行程)` 读占用，故只避开
+   **其他**快照的组占用、排除自身；原航路潮位复核 `_check_original` 完全不
+   读取占用与组关系，口径仍为只判潮位误差带。
+
 ### 同修订批次预排 / 确认（实现见 `app/services/batch.py`）
 
 1. **批次预排**：先解析批次修订号（显式指定须存在，否则取最新；未知沿用
    `TIDE_REVISION_NOT_FOUND`）；一次读取覆盖全批各船窗口并集区间
-   `[min(start), max(start+window-1)]` 的全部已确认占用。随后按 `ships` 优先顺序
-   逐艘调用上面的单船 DP（同一修订、同一择优规则），每艘规划成功后把其行程
-   `d..d+t-1` 并入内存中的 blocked 集合作为**下一艘**的占用；预排全程只读。
+   `[min(start), max(start+window-1)]` 的全部已确认占用（含狭窄水道组
+   展开）。随后按 `ships` 优先顺序逐艘调用上面的单船 DP（同一修订、同一
+   择优规则），每艘规划成功后把其行程 `d..d+t-1` 并入内存中的 blocked 并
+   **按当前组关系同步展开到整组**，作为下一艘的占用；预排全程只读。
    任一船抛 `NODE_NOT_FOUND` / `MISSING_TIDE_DATA` / `NO_FEASIBLE_ITINERARY` 时，
    原样附加 `ship_index`（首个失败序号，0 起）后抛出。
 2. **批次确认**（单事务 `BEGIN IMMEDIATE`）：先按幂等键查 `batch_confirmations`：
    命中且内容哈希（请求体去掉幂等键后的规范化 SHA-256）与修订号一致 -> 直接返回
    存储的首次结果（标记 `replayed=true`，**优先于修订新鲜度检查**）；命中但不一致
    -> `BATCH_KEY_CONFLICT`。新键时依次做：修订新鲜度（`REVISION_STALE`）->
-   读取当时已确认占用 -> 逐艘复算（`NO_FEASIBLE_ITINERARY` 转
+   读取当时已确认占用（含狭窄水道组展开）与当前组关系 -> 逐艘复算
+   （`NO_FEASIBLE_ITINERARY` 转
    `PLAN_MISMATCH(no_feasible_itinerary)`，与提交行程六元组逐段或抵达分钟不一致转
    `PLAN_MISMATCH(itinerary_mismatch)`，均带 `ship_index`）-> 复算通过即在同一事务
-   写入该船快照并把其**复算行程**并入后船占用。全部通过后写入幂等记录并 `COMMIT`；
+   写入该船快照并把其**复算行程**按组展开并入后船占用。全部通过后写入幂等记录并 `COMMIT`；
    任一异常 `ROLLBACK`，已插入快照随之撤销，实现全成全败。唯一键竞争（并发同键）
    在回滚后按已存在记录重判重放/冲突。
 
@@ -882,16 +1085,19 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 1. 只读取出已确认快照（行程号、快照修订、船舶参数、原起始分钟/窗口、完整行程 JSON），
    校验目标修订（缺省取最新；未知修订 `TIDE_REVISION_NOT_FOUND`），取全窗口名义
    潮位与误差，任一分钟缺名义潮位报 `MISSING_TIDE_DATA`；未知行程报 `TRIP_NOT_FOUND`。
-   另以 `load_occupancy(..., exclude_trip_id=本行程)` 读取**其他**已确认快照的占用。
+   另以 `load_occupancy(..., exclude_trip_id=本行程)` 读取**其他**已确认快照的占用
+   （同样按当前狭窄水道组关系展开为整组占用；本快照自身排除）。
 2. **原航路复核**：按快照航段顺序遍历每段原占用分钟（`d..d+t-1`），只用与规划相同的
    误差带 `_minute_ok` 判定（水深 `深度+名义−误差`、净空 `净空−名义−误差`），
-   **不检查与其他快照的占用重叠**；返回首个违规分钟及其 `depth`/`clearance` 原因；
-   `available_depth`/`available_clearance` 按上述对应极值计算。
+   **不检查与其他快照的占用重叠、也不读取组关系**；返回首个违规分钟及其
+   `depth`/`clearance` 原因；`available_depth`/`available_clearance` 按上述对应极值
+   计算。
 3. **改期 DP**：航段序列固定（快照的 k 个 `seg_id`），状态为「完成前 i 段、于某分钟
    抵达该段终点」，每状态只保留一个最优代价
    `(相对快照的出发分钟变动段数, 各段出发分钟序列)`（字典序）。可行表复用规划的
-   不可行分钟前缀和，每分钟的不可行原因同时包含误差带违规与**他船占用**（本快照自身
-   已排除）；各段航时按**改期请求时的当前管制**在出发分钟选定；第 i 段用「抵达分钟
+   不可行分钟前缀和，每分钟的不可行原因同时包含误差带违规、**他船航段占用**与
+   **他船经狭窄水道组展开的整组占用**（本快照自身已排除）；各段航时按**改期请求时的
+   当前管制**在出发分钟选定；第 i 段用「抵达分钟
    ≤ 当前出发分钟」的逐分钟最优前缀扫描（等待由前缀隐式表达），命中可行进入分钟即
    追加该段出发分钟与当时航时，单次判定 O(1)。
 4. 终态在全部抵达分钟上取 `(变动段数, 抵达分钟, 出发分钟序列)` 字典序最小者；无终态
@@ -912,11 +1118,12 @@ app/
   errors.py             # 统一业务错误（含 trip_not_found 构造器）
   schemas.py            # Pydantic 模型与入参校验（窗口<=1440、航时>0 等）
   services/controls.py  # 航段分时航时管制：区间校验、整组替换、按进入分钟取实际航时
-  services/planning.py  # 潮汐约束与时间展开 DP 规划算法（航时按进入分钟管制选定）
-  services/batch.py     # 同修订批次预排/确认（逐艘串行规划 + 事务复算 + 幂等键）
-  services/reschedule.py# 更正后原行程复核与改期 DP（复核按快照占用；改期按当前管制，只读）
-  main.py               # FastAPI 路由（节点/航段/分时管制/潮位更正与误差修订/单船与批次规划确认/复核改期）
-tests/                  # pytest 测试（104 个，含择优、缺潮位、事务冲突、误差带、复核改期、航段占用、批次预排/确认/幂等、分时航时管制等）
+  services/groups.py    # 狭窄水道组：登记（单事务、不留半成品）、组关系读取与整组占用展开
+  services/planning.py  # 潮汐约束与时间展开 DP 规划算法（航时按进入分钟管制选定；load_occupancy 展开组占用）
+  services/batch.py     # 同修订批次预排/确认（逐艘串行规划 + 事务复算 + 幂等键；批内拟占用同步展开组占用）
+  services/reschedule.py# 更正后原行程复核与改期 DP（复核只判潮位；改期避开他人组占用且排除自身、按当前管制，只读）
+  main.py               # FastAPI 路由（节点/航段/分时管制/狭窄水道组/潮位更正与误差修订/单船与批次规划确认/复核改期）
+tests/                  # pytest 测试（122 个，含择优、缺潮位、事务冲突、误差带、复核改期、航段占用、批次预排/确认/幂等、分时航时管制、狭窄水道组等）
 Dockerfile
 docker-compose.yml
 requirements.txt

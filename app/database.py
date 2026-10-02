@@ -72,6 +72,21 @@ CREATE TABLE IF NOT EXISTS segment_travel_controls (
     travel_time   INTEGER NOT NULL CHECK (travel_time > 0),            -- 管制通行分钟（正整数）
     PRIMARY KEY (seg_id, start_minute)
 );
+
+-- 狭窄水道组：组建成后不可修改（无更新/删除接口）；每条航段至多属于一个组。
+-- 组占用在规划时按当前组成员关系自快照原占用展开（见 services/groups.py）。
+CREATE TABLE IF NOT EXISTS channel_groups (
+    group_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    note        TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS channel_group_members (
+    group_id   INTEGER NOT NULL REFERENCES channel_groups(group_id),
+    seg_id     INTEGER NOT NULL UNIQUE REFERENCES segments(seg_id),  -- 航段不得重复归组
+    position   INTEGER NOT NULL,                                    -- 提交集合中的次序（0 起）
+    PRIMARY KEY (group_id, seg_id)
+);
 """
 
 

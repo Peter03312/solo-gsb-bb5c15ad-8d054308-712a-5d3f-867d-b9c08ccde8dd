@@ -73,13 +73,20 @@ def _minute_ok(seg: Segment, tide: float, error: float,
 
 def load_occupancy(conn, lo: int, hi: int, exclude_trip_id: Optional[int] = None
                    ) -> dict[int, set[int]]:
-    """读取 [lo, hi] 闭区间内全部已确认行程的航段占用。
+    """读取 [lo, hi] 闭区间内全部已确认行程的航段占用（含狭窄水道组展开）。
 
     返回 {seg_id: {占用分钟, ...}}。每段从进入分钟 d 起占用
     d, d+1, …, d+travel_time-1（抵达分钟不占用）。既有快照即使彼此重叠也
     原样保留——它们就是后续规划必须避开的占用。
     exclude_trip_id 用于改期复核：建议须避开其他已确认快照，但排除自身。
+
+    狭窄水道组：快照任一段若属于某组，该段原占用（按其固化航时）展开到
+    组内全部成员航段的同一批分钟——船进入组内任一航段即独占整组。组建前
+    的已确认快照同样按原航段与固化航时计入新组占用（快照不改写，组建前
+    已有的重叠也不清理）。
     """
+    from .groups import expand_group_occupancy, load_groups
+
     sql = "SELECT itinerary FROM confirmed_trips"
     params: list = []
     if exclude_trip_id is not None:
@@ -95,6 +102,9 @@ def load_occupancy(conn, lo: int, hi: int, exclude_trip_id: Optional[int] = None
             occupied.setdefault(leg["seg_id"], set()).update(
                 range(max(lo, d), min(hi, end) + 1)
             )
+    seg_to_group, group_members = load_groups(conn)
+    expand_group_occupancy(occupied, seg_to_group, group_members)
+    # 展开可能引入 [lo,hi] 之外航段的键，但其分钟来自区间内原占用，裁剪口径不变
     return occupied
 
 
