@@ -72,6 +72,25 @@ CREATE TABLE IF NOT EXISTS segment_travel_controls (
     travel_time   INTEGER NOT NULL CHECK (travel_time > 0),            -- 管制通行分钟（正整数）
     PRIMARY KEY (seg_id, start_minute)
 );
+
+-- 狭窄水道组：至少两条现有航段登记为同一组；组建成后不可修改（无更新/删除
+-- 端点），每条航段至多属于一个组（members.seg_id 唯一索引保证）。船进入组内
+-- 任一航段即从进入分钟到抵达前一分钟独占整组。
+CREATE TABLE IF NOT EXISTS channel_groups (
+    group_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    note        TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS channel_group_members (
+    group_id INTEGER NOT NULL REFERENCES channel_groups(group_id),
+    seg_id   INTEGER NOT NULL REFERENCES segments(seg_id),
+    PRIMARY KEY (group_id, seg_id)
+);
+
+-- 航段不得重复归组：每条航段最多出现在一个组中
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_group_members_seg
+    ON channel_group_members(seg_id);
 """
 
 

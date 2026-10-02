@@ -8,7 +8,9 @@ d, d+1, ..., d+t-1，于 d+t 抵达下一节点）。
   * 深度：静水深度 + 名义潮位 − 误差 ≥ 吃水 + 安全余量（真值可能偏低）
   * 桥梁：桥底净空 − 名义潮位 − 误差 ≥ 水面以上高度 + 安全余量（真值可能偏高，有桥时）
   * 独占：同一航段同一分钟已被其他**已确认**行程占用时不可再进入（进入
-    分钟 d 至抵达前一分钟 d+t-1 独占该航段；节点等待不占用航段）
+    分钟 d 至抵达前一分钟 d+t-1 独占该航段；节点等待不占用航段）；
+    已归组航段按**狭窄水道组**整组独占——组内任一成员航段的占用分钟
+    对全组封闭（见 services/groups.py）
 等待不占用航段，不参与校验。
 
 择优：最早抵达；同一抵达时刻按航段编号序列字典序（小者优先）。
@@ -23,6 +25,7 @@ from typing import Optional
 from .. import config
 from ..errors import ApiError, no_itinerary, tide_missing, unknown_node
 from .controls import effective_travel_time, load_controls
+from .groups import expand_blocked_for_groups, load_group_map
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,10 @@ def load_occupancy(conn, lo: int, hi: int, exclude_trip_id: Optional[int] = None
     d, d+1, …, d+travel_time-1（抵达分钟不占用）。既有快照即使彼此重叠也
     原样保留——它们就是后续规划必须避开的占用。
     exclude_trip_id 用于改期复核：建议须避开其他已确认快照，但排除自身。
+
+    狭窄水道组：组建前已确认的快照同样按其原航段与固化航时计入；读取后
+    把组内任一成员航段的占用分钟并集扩散到全组各成员——船进入组内任一
+    航段即从进入分钟到抵达前一分钟独占整组，不同成员航段的通行不得重叠。
     """
     sql = "SELECT itinerary FROM confirmed_trips"
     params: list = []
@@ -95,6 +102,7 @@ def load_occupancy(conn, lo: int, hi: int, exclude_trip_id: Optional[int] = None
             occupied.setdefault(leg["seg_id"], set()).update(
                 range(max(lo, d), min(hi, end) + 1)
             )
+    expand_blocked_for_groups(occupied, load_group_map(conn))
     return occupied
 
 

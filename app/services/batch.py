@@ -4,13 +4,14 @@
 
 * **预排**（只读，不占位）：逐艘沿用单船 `find_itinerary` 的最早抵达 +
   同刻航段编号序列字典序择优；排序靠后的船除避开**已确认占用**外，还须
-  避开本批前船的**拟占用**。任一船无解即指出首个失败序号。
+  避开本批前船的**拟占用**（已归组航段按狭窄水道组对全组封闭）。任一船
+  无解即指出首个失败序号。
 * **确认**（单个 `BEGIN IMMEDIATE` 事务）：核对修订是否仍为最新
-  （过期 `REVISION_STALE`），在同一事务内读取当时已确认占用并逐艘复算、
-  逐段比对（前船复算行程同样作为后船的占用）；任一船无解或不一致均
-  `PLAN_MISMATCH`，**全批不保存**。通过后一次写入全部不可变行程快照，
-  并以批次幂等键登记首次结果：同键同内容重试返回原结果（即使修订已
-  更新），同键异内容 `BATCH_KEY_CONFLICT`。
+  （过期 `REVISION_STALE`），在同一事务内按**当前组关系**读取当时已确认
+  占用并逐艘复算、逐段比对（前船复算行程同样作为后船的占用）；任一船无解
+  或不一致均 `PLAN_MISMATCH`，**全批不保存**。通过后一次写入全部不可变
+  行程快照，并以批次幂等键登记首次结果：同键同内容重试返回原结果（即使
+  修订已更新），同键异内容 `BATCH_KEY_CONFLICT`。
 """
 import hashlib
 import json
@@ -18,6 +19,7 @@ import sqlite3
 from typing import Iterable, Optional
 
 from ..errors import ApiError
+from .groups import add_leg_occupancy, load_group_map
 from .planning import find_itinerary, load_occupancy
 
 
@@ -40,15 +42,17 @@ def _ship_kwargs(ship) -> dict:
     }
 
 
-def _add_itinerary_occupancy(blocked: dict[int, set[int]], legs: Iterable[dict]) -> None:
+def _add_itinerary_occupancy(blocked: dict[int, set[int]], legs: Iterable[dict],
+                             seg_to_group: Optional[dict[int, int]] = None) -> None:
     """把一段行程（拟占用或已复算占用）并入 blocked：{seg_id: {绝对分钟}}。
 
     占用语义与 load_occupancy 一致：进入分钟 d 占用 d..d+travel_time-1，
-    抵达分钟不占用。
+    抵达分钟不占用；航段已归组时按狭窄水道组对全组各成员一并封闭。
     """
+    seg_to_group = seg_to_group or {}
     for leg in legs:
         d, t = leg["start_minute"], leg["travel_time"]
-        blocked.setdefault(leg["seg_id"], set()).update(range(d, d + t))
+        add_leg_occupancy(blocked, leg["seg_id"], range(d, d + t), seg_to_group)
 
 
 def _norm_legs(legs) -> list[tuple]:
@@ -103,9 +107,11 @@ def plan_batch(conn, ships: list, revision: Optional[int]) -> dict:
     rev = _resolve_revision(conn, revision)
 
     # 已确认占用只取覆盖全批各船窗口的并集区间，一次读入后逐艘复用
+    # （load_occupancy 已按当前组关系做狭窄水道组整组扩散）
     lo = min(s.start_minute for s in ships)
     hi = max(s.start_minute + s.window_minutes - 1 for s in ships)
     blocked = load_occupancy(conn, lo, hi)
+    seg_to_group = load_group_map(conn)
 
     results = []
     for i, ship in enumerate(ships):
@@ -115,7 +121,7 @@ def plan_batch(conn, ships: list, revision: Optional[int]) -> dict:
             )
         except ApiError as exc:
             raise _tag_ship_error(i, exc)
-        _add_itinerary_occupancy(blocked, result["itinerary"])
+        _add_itinerary_occupancy(blocked, result["itinerary"], seg_to_group)
         results.append({"index": i, **result})
     return {"revision": rev, "ships": results}
 
@@ -219,10 +225,11 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
         if latest is None or latest["revision"] != body.revision:
             raise _stale_error(body.revision, latest["revision"] if latest else None)
 
-        # 2) 当时已确认占用（覆盖全批窗口的并集区间）
+        # 2) 当时已确认占用（覆盖全批窗口的并集区间）与**当前**狭窄水道组关系
         lo = min(s.start_minute for s in body.ships)
         hi = max(s.start_minute + s.window_minutes - 1 for s in body.ships)
         blocked = load_occupancy(conn, lo, hi)
+        seg_to_group = load_group_map(conn)
 
         trip_refs: list[dict] = []
         for i, ship in enumerate(body.ships):
@@ -268,8 +275,9 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
                 "arrival_minute": recalculated["arrival_minute"],
                 "itinerary": recalculated["itinerary"],
             })
-            # 前船复算行程作为后船的当时占用
-            _add_itinerary_occupancy(blocked, recalculated["itinerary"])
+            # 前船复算行程作为后船的当时占用（归组航段对全组封闭）
+            _add_itinerary_occupancy(blocked, recalculated["itinerary"],
+                                     seg_to_group)
 
         result = {
             "idempotency_key": key,

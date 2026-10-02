@@ -66,6 +66,22 @@ class TravelControlListOut(BaseModel):
     )
 
 
+# ---- 狭窄水道组 -----------------------------------------------------------------
+
+class ChannelGroupCreateRequest(BaseModel):
+    segment_ids: list[int] = Field(
+        min_length=2,
+        description="登记为同一狭窄水道组的航段编号集合（至少两条现有航段，"
+                    "不得重复、不得已属其他组）；组建成后不可修改",
+    )
+    note: Optional[str] = Field(default=None, description="备注")
+
+
+class ChannelGroupOut(BaseModel):
+    group_id: int = Field(description="狭窄水道组号（自增）")
+    segment_ids: list[int] = Field(description="组成员航段编号（按编号升序）")
+
+
 # ---- 潮位 ----------------------------------------------------------------------
 
 class TideCorrection(BaseModel):

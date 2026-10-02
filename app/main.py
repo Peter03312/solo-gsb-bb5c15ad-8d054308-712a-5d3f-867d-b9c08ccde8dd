@@ -16,6 +16,8 @@ from .schemas import (
     BatchConfirmResponse,
     BatchPlanRequest,
     BatchPlanResponse,
+    ChannelGroupCreateRequest,
+    ChannelGroupOut,
     ConfirmRequest,
     NodeIn,
     PlanRequest,
@@ -34,6 +36,7 @@ from .schemas import (
 )
 from .services.batch import confirm_batch, plan_batch
 from .services.controls import load_controls, replace_segment_controls
+from .services.groups import create_channel_group, get_channel_group, list_channel_groups
 from .services.planning import find_itinerary, load_occupancy
 from .services.reschedule import review_and_reschedule
 
@@ -185,6 +188,38 @@ def get_travel_controls(seg_id: int):
     """读取航段当前生效的分时航时管制清单（按起点升序）。"""
     with get_conn() as conn:
         return _control_list_out(conn, seg_id)
+
+
+# ---- 狭窄水道组 ------------------------------------------------------------------
+
+@app.post("/api/channel-groups", status_code=201,
+          response_model=ChannelGroupOut, tags=["channel-groups"])
+def create_group(body: ChannelGroupCreateRequest):
+    """把至少两条现有航段登记为同一狭窄水道组，返回组号与成员清单。
+
+    组建成后不可修改；每条航段至多属于一个组。拒绝：提交集合含重复编号
+    （422 DUPLICATE_SEGMENT_IDS）、未知航段（404 SEGMENT_NOT_FOUND）、
+    航段已属其他组（409 SEGMENT_ALREADY_GROUPED）；任一失败整体回滚，
+    不留半成品。船进入组内任一航段即从进入分钟到抵达前一分钟独占整组。
+    """
+    with get_conn() as conn:
+        return create_channel_group(conn, body.segment_ids, body.note)
+
+
+@app.get("/api/channel-groups", response_model=list[ChannelGroupOut],
+         tags=["channel-groups"])
+def list_groups():
+    """狭窄水道组列表（按组号升序，成员按航段编号升序）。"""
+    with get_conn() as conn:
+        return list_channel_groups(conn)
+
+
+@app.get("/api/channel-groups/{group_id}", response_model=ChannelGroupOut,
+         tags=["channel-groups"])
+def get_group(group_id: int):
+    """按组号查询狭窄水道组；未知组号 404 CHANNEL_GROUP_NOT_FOUND。"""
+    with get_conn() as conn:
+        return get_channel_group(conn, group_id)
 
 
 # ---- 潮位修订 --------------------------------------------------------------------
